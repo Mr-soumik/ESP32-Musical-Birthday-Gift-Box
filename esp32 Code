@@ -1,0 +1,762 @@
+/*
+  Musical Happy Birthday Gift Box  (Reel Edition) by TECHTADKA360  -  ESP32 + 0.96" SSD1306 OLED
+  Works with ESP32 Arduino core 2.x and 3.x
+
+  Flow (same as the reel, then loops forever):
+    1) TIMER      "11:59:56" -> "11:59:59", one beep per second   (4 s)
+    2) IT'S TIME  "12:00 PM  It's Time!" + alert trill + popper    (3.15 s)
+    3) BIRTHDAY   Happy Birthday melody, lyrics synced per note    (14 s)
+    4) OUTRO      "Make a Wish!" candles blow out, sparkles        (5.6 s)
+
+  Libraries (Library Manager): Adafruit GFX Library, Adafruit SSD1306
+  (Wire and the fonts are included with them.)
+
+  Wiring (3.3V safe)
+    OLED   VCC->3V3  GND->GND  SDA->GPIO21  SCL->GPIO22
+    Buzzer (2-pin passive)  + -> GPIO25   - -> GND
+    LEDs   GPIO 23, 19, 18, 5, 4, 15 -> 220 ohm -> LED long leg, short leg -> GND
+
+  Easy settings are right below: NAME_TEXT, OCTAVE_SHIFT, UNIT_MS.
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <math.h>
+
+// ================== EASY SETTINGS ==================
+#define NAME_TEXT "Friend"            // shown in "Happy birthday dear ____" (max ~10 letters)
+const uint8_t  OCTAVE_SHIFT = 0;      // 0 = exactly like the reel. 1 = one octave higher (louder on tiny buzzers)
+const uint32_t UNIT_MS      = 281;    // length of one eighth-note. Lower = faster song (reel = 281)
+const uint8_t  START_SEC    = 56;     // countdown starts at 11:59:56 and runs 4 ticks (56,57,58,59)
+// ===================================================
+
+// ---------- types (kept at the top so the Arduino auto-prototypes can see them) ----------
+struct Confetti  { float x, y, vy, sway, ph; uint8_t kind; };
+struct FloatNote { float x, y, ph; bool on; };
+struct Spark     { float x, y, vx, vy; int8_t life; };
+struct Note      { uint16_t f; uint8_t u; int8_t w; };   // freq, length in units, lyric word index (-1 = keep word)
+struct FontSel   { const GFXfont *f; uint8_t s; };
+enum Phase { PH_TIMER, PH_ITSTIME, PH_PLAY, PH_OUTRO };
+
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define OLED_ADDR 0x3C
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define BUZZER_PIN 25
+
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+
+const uint8_t LED_PINS[6] = {23, 19, 18, 5, 4, 15};
+
+// ---------- timing ----------
+const uint32_t TIMER_MS = 4000;
+const uint32_t TIME_MS  = 3200;
+const uint32_t OUTRO_MS = 5600;
+const uint32_t BLOW_MS  = 3400;   // candles blow out during outro
+const uint32_t FRAME_MS = 33;     // ~30 fps
+
+// ---------- notes (C major, exactly the reel's melody) ----------
+#define N_C4  262
+#define N_D4  294
+#define N_E4  330
+#define N_F4  349
+#define N_G4  392
+#define N_A4  440
+#define N_AS4 466
+#define N_C5  523
+#define N_E5  659
+#define N_G5  784
+#define N_C6  1047
+
+// word index: 0 Happy, 1 Birthday, 2 to, 3 You, 4 Dear, 5 NAME
+const char* words[] = {"Happy", "Birthday", "to", "You", "Dear", NAME_TEXT};
+
+const Note melody[] = {
+  // Happy birthday to you
+  {N_C4, 1, 0}, {N_C4, 1, -1}, {N_D4, 2, 1}, {N_C4, 2, -1}, {N_F4, 2, 2}, {N_E4, 4, 3},
+  // Happy birthday to you
+  {N_C4, 1, 0}, {N_C4, 1, -1}, {N_D4, 2, 1}, {N_C4, 2, -1}, {N_G4, 2, 2}, {N_F4, 4, 3},
+  // Happy birthday dear NAME
+  {N_C4, 1, 0}, {N_C4, 1, -1}, {N_C5, 2, 1}, {N_A4, 2, -1}, {N_F4, 2, 4}, {N_E4, 2, 5}, {N_D4, 4, -1},
+  // Happy birthday to you
+  {N_AS4, 1, 0}, {N_AS4, 1, -1}, {N_A4, 2, 1}, {N_F4, 2, -1}, {N_G4, 2, 2}, {N_F4, 4, 3}
+};
+const int NOTE_COUNT = sizeof(melody) / sizeof(melody[0]);
+
+// ---------- state shared between audio loop (core 1) and animation task (core 0) ----------
+volatile Phase    phase = PH_TIMER;
+volatile uint32_t phaseStart = 0;
+volatile int      curWord = -1;
+volatile uint32_t wordStart = 0;
+volatile uint32_t beat = 0;
+
+int      noteIdx = 0;
+uint32_t noteStart = 0;
+bool     gapDone = false;
+int      lastTick = -1;
+bool     beepOn = false;
+bool     trillOn = false;
+int      lastStep = -1;
+int      lastOutroStep = -1;
+
+// ---------- buzzer (works on core 2.x and 3.x) ----------
+void buzzSetup() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(BUZZER_PIN, 2000, 8);
+#else
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(BUZZER_PIN, 0);
+#endif
+}
+
+void buzzRaw(uint16_t f) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(BUZZER_PIN, f);
+#else
+  ledcWriteTone(0, f);
+#endif
+}
+
+void buzzNote(uint16_t f) {
+  buzzRaw(f ? (uint16_t)(f << OCTAVE_SHIFT) : 0);
+}
+
+// ---------- LEDs ----------
+void ledsMask(uint8_t m) {
+  for (int i = 0; i < 6; i++) digitalWrite(LED_PINS[i], (m >> i) & 1);
+}
+
+uint8_t pairMask(int i) {           // two LEDs from both ends: 0&5, 1&4, 2&3 ...
+  i = i % 6;
+  return (uint8_t)((1 << i) | (1 << (5 - i)));
+}
+
+const uint8_t TICK_MASK[4] = {0x21, 0x12, 0x0C, 0x3F};   // outside-in, last tick = all LEDs
+
+// ---------- phases (audio side) ----------
+void startTimer() {
+  buzzRaw(0);
+  ledsMask(0);
+  curWord = -1;
+  lastTick = -1;
+  beepOn = false;
+  phaseStart = millis();
+  phase = PH_TIMER;
+}
+
+void startItsTime() {
+  buzzRaw(0);
+  ledsMask(0);
+  trillOn = false;
+  lastStep = -1;
+  phaseStart = millis();
+  phase = PH_ITSTIME;
+}
+
+void startNote(int i) {
+  buzzNote(melody[i].f);
+  ledsMask(pairMask(i));
+  if (melody[i].w >= 0) {
+    wordStart = millis();
+    curWord = melody[i].w;
+  }
+  gapDone = false;
+  beat++;
+}
+
+void startPlay() {
+  noteIdx = 0;
+  noteStart = millis();
+  phaseStart = noteStart;
+  phase = PH_PLAY;
+  startNote(0);
+}
+
+void startOutro() {
+  buzzRaw(0);
+  ledsMask(0);
+  lastOutroStep = -1;
+  phaseStart = millis();
+  phase = PH_OUTRO;
+}
+
+void updateTimer(uint32_t t) {
+  if (t >= TIMER_MS) { startItsTime(); return; }
+  int tick = t / 1000;
+  if (tick > 3) tick = 3;
+  uint32_t ms = t - (uint32_t)tick * 1000;
+  if (tick != lastTick) {
+    lastTick = tick;
+    buzzRaw(1000);                  // tick beep, like the reel
+    ledsMask(TICK_MASK[tick]);
+    beepOn = true;
+  }
+  if (beepOn && ms >= 130) {
+    buzzRaw(0);
+    ledsMask(0);
+    beepOn = false;
+  }
+}
+
+void updateItsTime(uint32_t t) {
+  if (t >= TIME_MS) { startPlay(); return; }
+  bool on = (t % 100) < 60;         // fast alert trill: 60 ms on / 40 ms off
+  if (on != trillOn) {
+    trillOn = on;
+    buzzRaw(on ? 1500 : 0);
+  }
+  int step = t / 70;                // LEDs sweep out and back
+  if (step != lastStep) {
+    lastStep = step;
+    int p = step % 10;
+    int idx = (p <= 5) ? p : 10 - p;
+    ledsMask(pairMask(idx));
+  }
+}
+
+void updatePlay(uint32_t now) {
+  uint32_t dur = (uint32_t)melody[noteIdx].u * UNIT_MS;
+  uint32_t el = now - noteStart;
+  if (el >= dur) {
+    noteStart += dur;               // no timing drift
+    noteIdx++;
+    if (noteIdx >= NOTE_COUNT) startOutro();
+    else startNote(noteIdx);
+  } else if (!gapDone && el >= dur * 75 / 100) {
+    buzzRaw(0);                     // short gap so every note is clear (same 75% as the reel)
+    ledsMask(0);
+    gapDone = true;
+  }
+}
+
+void updateOutro(uint32_t now) {
+  uint32_t t = now - phaseStart;
+  static const uint16_t ta[4] = {N_C5, N_E5, N_G5, N_C6};   // ta-da!
+  int step = t / 130;
+  if (step > 3) step = 3;
+  if (t < 900) {
+    if (step != lastOutroStep) { lastOutroStep = step; buzzNote(ta[step]); }
+  } else if (lastOutroStep != 99) {
+    lastOutroStep = 99;
+    buzzRaw(0);
+  }
+  if (t < 4800) {
+    bool ph = (t / 150) & 1;
+    ledsMask(ph ? 0x2A : 0x15);
+  } else {
+    ledsMask(0);
+  }
+  if (t >= OUTRO_MS) startTimer();  // loop forever
+}
+
+// =====================================================================
+//                              GRAPHICS
+// =====================================================================
+const FontSel FS_B12 = { &FreeSansBold12pt7b, 1 };
+const FontSel FS_B9  = { &FreeSansBold9pt7b, 1 };
+const FontSel FS_X2  = { NULL, 2 };
+const FontSel FS_X1  = { NULL, 1 };
+const FontSel LYR[3] = { FS_B9, FS_X2, FS_X1 };
+const FontSel BIG[4] = { FS_B12, FS_B9, FS_X2, FS_X1 };
+
+Confetti  conf[18];
+FloatNote fnotes[5];
+#define SPARKS 48
+Spark     sp[SPARKS];
+
+float    pulse = 0;
+uint32_t lastBeat = 0;
+
+float easeOut(float x) {
+  if (x < 0) x = 0;
+  if (x > 1) x = 1;
+  x = 1.0f - x;
+  return 1.0f - x * x * x;
+}
+
+int advOf(const GFXfont *f, char c) {
+  return f->glyph[c - f->first].xAdvance;
+}
+
+int textAdv(const GFXfont *f, const char *s) {
+  int w = 0;
+  for (; *s; s++) w += advOf(f, *s);
+  return w;
+}
+
+void useFont(const FontSel &fs) {
+  display.setFont(fs.f);
+  display.setTextSize(fs.s);
+}
+
+void textBox(const char *s, const FontSel &fs, int16_t &x1, int16_t &y1, uint16_t &w, uint16_t &h) {
+  useFont(fs);
+  display.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+}
+
+FontSel fitFont(const char *s, int maxW, int maxH, const FontSel *list, int n) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  for (int i = 0; i < n; i++) {
+    textBox(s, list[i], x1, y1, w, h);
+    if ((int)w <= maxW && (int)h <= maxH) return list[i];
+  }
+  return list[n - 1];
+}
+
+// centered text whose top edge sits at 'top'
+void drawTextC(const char *s, int cx, int top, const FontSel &fs) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  textBox(s, fs, x1, y1, w, h);
+  display.setTextColor(WHITE);
+  display.setCursor(cx - (int)w / 2 - x1, top - y1);
+  display.print(s);
+}
+
+// lyric band at the bottom: slides up from below
+void drawBand(const char *s, uint32_t since, const FontSel *list, int n) {
+  display.fillRect(0, 45, 128, 19, BLACK);
+  FontSel fs = fitFont(s, 124, 18, list, n);
+  int dy = (int)((1.0f - easeOut(since / 150.0f)) * 18);
+  int16_t x1, y1;
+  uint16_t w, h;
+  textBox(s, fs, x1, y1, w, h);
+  display.setTextColor(WHITE);
+  display.setCursor((128 - (int)w) / 2 - x1, 46 + dy - y1);
+  display.print(s);
+  display.setFont(NULL);
+  display.setTextSize(1);
+}
+
+void resetConf(Confetti &c, bool top) {
+  c.x = random(0, 128);
+  c.y = top ? -(float)random(0, 6) : (float)random(0, 44);
+  c.vy = 0.5f + random(0, 10) / 10.0f;
+  c.sway = random(5, 15) / 10.0f;
+  c.ph = random(0, 628) / 100.0f;
+  c.kind = random(0, 3);
+}
+
+void spawnNote() {
+  for (int i = 0; i < 5; i++) {
+    if (!fnotes[i].on) {
+      fnotes[i].on = true;
+      fnotes[i].x = random(0, 2) ? 28 : 98;
+      fnotes[i].y = 36;
+      fnotes[i].ph = random(0, 628) / 100.0f;
+      return;
+    }
+  }
+}
+
+void sparkle(int x, int y, int r) {
+  display.drawFastHLine(x - r, y, 2 * r + 1, WHITE);
+  display.drawFastVLine(x, y - r, 2 * r + 1, WHITE);
+  if (r >= 2) {
+    display.drawPixel(x - 1, y - 1, WHITE);
+    display.drawPixel(x + 1, y - 1, WHITE);
+    display.drawPixel(x - 1, y + 1, WHITE);
+    display.drawPixel(x + 1, y + 1, WHITE);
+  }
+}
+
+// ---------------------------------------------------------------------
+//  Scene 1: TIMER  (11:59:56 -> 11:59:59, rolling seconds digit)
+// ---------------------------------------------------------------------
+void sceneTimer(uint32_t now, int32_t t) {
+  const GFXfont *F = &FreeSansBold12pt7b;
+  int tick = t / 1000;
+  if (tick > 3) tick = 3;
+  int ms = t - tick * 1000;
+  if (ms > 999) ms = 999;
+  int sec = START_SEC + tick;
+
+  // geometry of the big digits
+  const GFXglyph *g0 = &F->glyph['0' - F->first];
+  int hd = g0->height;
+  int top = 14;
+  int base = top - g0->yOffset;
+  int au = advOf(F, '0');
+  char pre[10];
+  snprintf(pre, sizeof(pre), "11:59:%d", sec / 10);
+  int total = textAdv(F, "11:59:") + 2 * au;
+  int x0 = (128 - total) / 2;
+  int xu = x0 + textAdv(F, pre);                 // x of the units digit
+
+  bool flash = (ms < 70);                         // white flash behind the digits on every tick
+  uint16_t col = flash ? BLACK : WHITE;
+  if (flash) display.fillRoundRect(3, top - 2, 122, hd + 4, 3, WHITE);
+
+  display.setFont(F);
+  display.setTextSize(1);
+  display.setTextColor(col);
+  display.setCursor(x0, base);
+  display.print(pre);
+
+  // units digit rolls up like a flip counter
+  int lineH = hd + 8;
+  float r = (tick == 0) ? 1.0f : easeOut(ms / 230.0f);
+  int offNew = (int)((1.0f - r) * lineH);
+  if (tick > 0 && r < 1.0f) {
+    display.setCursor(xu, base - (int)(r * lineH));
+    display.write('0' + (sec - 1) % 10);
+  }
+  display.setCursor(xu, base + offNew);
+  display.write('0' + sec % 10);
+  // clip the rolling digit to the digit band
+  display.fillRect(xu - 2, top - lineH, au + 4, lineH, BLACK);
+  display.fillRect(xu - 2, top + hd, au + 4, lineH, BLACK);
+  if (flash) {                                     // restore the white band edge that the clip removed
+    display.fillRect(xu - 2, top - 2, au + 4, 2, WHITE);
+    display.fillRect(xu - 2, top + hd, au + 4, 2, WHITE);
+  }
+
+  display.setFont(NULL);
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  // header:  o--- TIMER ---o   with two tiny clocks
+  drawTextC("TIMER", 64, 2, FS_X1);
+  display.drawFastHLine(14, 5, 38, WHITE);
+  display.drawFastHLine(76, 5, 38, WHITE);
+  for (int k = 0; k < 2; k++) {
+    int cx = k ? 121 : 6;
+    display.drawCircle(cx, 5, 4, WHITE);
+    display.drawFastVLine(cx, 2, 3, WHITE);                       // hour hand at 12
+    float a = -1.5708f + ms * 0.0062832f;                         // seconds hand, one turn per second
+    display.drawLine(cx, 5, cx + (int)roundf(cosf(a) * 3), 5 + (int)roundf(sinf(a) * 3), WHITE);
+  }
+
+  // caption
+  drawTextC("until 12:00 PM", 64, 41, FS_X1);
+
+  // progress bar with 4 segments (one per second)
+  display.drawRoundRect(4, 53, 120, 9, 4, WHITE);
+  int fw = (int)(112.0f * (float)t / (float)TIMER_MS);
+  if (fw > 112) fw = 112;
+  if (fw > 0) display.fillRoundRect(8, 56, fw, 3, 1, WHITE);
+  for (int k = 1; k < 4; k++) display.drawFastVLine(4 + 30 * k, 50, 2, WHITE);
+}
+
+// ---------------------------------------------------------------------
+//  Scene 2: IT'S TIME  (12:00 PM + wavy "It's Time!" + popper)
+// ---------------------------------------------------------------------
+// party popper: n confetti pieces shot up from a point on the bottom edge
+void emitBurst(int srcX, int n, int aMin, int aMax) {
+  int k = 0;
+  for (int i = 0; i < SPARKS && k < n; i++) {
+    if (sp[i].life > 0) continue;
+    float a = (aMin + random(0, aMax - aMin)) * 0.0174533f;
+    float v = 2.6f + random(0, 26) / 10.0f;
+    sp[i].x = srcX + random(-3, 4);
+    sp[i].y = 63;
+    sp[i].vx = cosf(a) * v;
+    sp[i].vy = sinf(a) * v;
+    sp[i].life = 34 + random(0, 16);
+    k++;
+  }
+}
+
+void stepSparks() {
+  for (int i = 0; i < SPARKS; i++) {
+    if (sp[i].life <= 0) continue;
+    sp[i].x += sp[i].vx;
+    sp[i].y += sp[i].vy;
+    sp[i].vy += 0.14f;
+    sp[i].vx *= 0.99f;
+    sp[i].life--;
+    int x = (int)sp[i].x, y = (int)sp[i].y;
+    if (y > 63 || x < 0 || x > 126) { sp[i].life = 0; continue; }
+    if (i % 3 == 0)      display.drawLine(x, y, x + 2, y + 1, WHITE);       // streamer
+    else if (i % 3 == 1) display.fillRect(x, y, 2, 2, WHITE);               // square
+    else                 display.drawPixel(x, y, WHITE);                    // dot
+  }
+}
+
+void chevron(int x, int cy, bool lit) {
+  if (lit) display.fillTriangle(x, cy - 4, x, cy + 4, x + 5, cy, WHITE);
+  else     display.drawTriangle(x, cy - 4, x, cy + 4, x + 5, cy, WHITE);
+}
+
+void sceneTime(uint32_t now, int32_t t) {
+  static int32_t nextBurst = 0;
+  if (t < 70) {                                   // camera-flash
+    display.fillScreen(WHITE);
+    nextBurst = 0;
+    return;
+  }
+  if (t >= nextBurst) {                           // three poppers: left, centre, right
+    emitBurst(14, 9, -85, -20);
+    emitBurst(64, 10, -150, -30);
+    emitBurst(113, 9, -160, -95);
+    nextBurst = t + 600;
+  }
+  stepSparks();
+
+  const GFXfont *F = &FreeSansBold12pt7b;
+  const GFXfont *S = &FreeSansBold9pt7b;
+
+  // ---- row A:  12:00 PM  (drops in from the top)
+  int wBig = textAdv(F, "12:00");
+  int wPM  = textAdv(S, "PM");
+  int x0 = (128 - (wBig + 4 + wPM)) / 2;
+  const GFXglyph *g0 = &F->glyph['0' - F->first];
+  int dropY = (int)((1.0f - easeOut((t - 70) / 380.0f)) * 32);
+  int base = 2 - g0->yOffset - dropY;
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setFont(F);
+  display.setCursor(x0, base);
+  display.print("12:00");
+  display.setFont(S);
+  display.setCursor(x0 + wBig + 4, base);
+  display.print("PM");
+
+  // ---- the "==" rule under the time, grows from the centre
+  int rw = (int)(easeOut((t - 250) / 450.0f) * 108);
+  if (rw > 0) {
+    display.drawFastHLine(64 - rw / 2, base + 4, rw, WHITE);
+    display.drawFastHLine(64 - rw / 2, base + 6, rw, WHITE);
+  }
+
+  // ---- row B:  It's Time!  (letters pop in, then ride a wave)
+  const char *msg = "It's Time!";
+  int wm = textAdv(S, msg);
+  int xm = (128 - wm) / 2;
+  const GFXglyph *gT = &S->glyph['T' - S->first];
+  int baseB = 33 - gT->yOffset;
+  display.setFont(S);
+  int x = xm;
+  for (int i = 0; msg[i]; i++) {
+    int32_t ti = t - 450 - i * 45;
+    if (ti > 0) {
+      int pop = (int)((1.0f - easeOut(ti / 160.0f)) * 12);
+      int dy = (int)roundf(sinf(now / 110.0f + i * 0.7f) * 2.0f);
+      display.setCursor(x, baseB + dy + pop);
+      display.write(msg[i]);
+    }
+    x += advOf(S, msg[i]);
+  }
+  display.setFont(NULL);
+
+  // ---- arrows  ->  It's Time!  ->   (blink like a chase)
+  if (t > 450) {
+    int cy = 33 + 6;
+    bool a = ((now / 140) & 1) == 0;
+    chevron(xm - 17, cy, a);
+    chevron(xm - 9,  cy, !a);
+    chevron(xm + wm + 4,  cy, a);
+    chevron(xm + wm + 12, cy, !a);
+  }
+
+  // ---- six dots that mirror the real LED sweep (same pattern as updateItsTime)
+  int step = t / 70;
+  int p = step % 10;
+  uint8_t m = pairMask((p <= 5) ? p : 10 - p);
+  for (int i = 0; i < 6; i++) {
+    int cx = 24 + i * 16;
+    if ((m >> i) & 1) display.fillCircle(cx, 57, 3, WHITE);
+    else              display.drawCircle(cx, 57, 3, WHITE);
+  }
+}
+
+// ---------------------------------------------------------------------
+//  Scene 3/4: BIRTHDAY + OUTRO  (cake, candles, balloons, confetti)
+// ---------------------------------------------------------------------
+void drawConfetti(uint32_t now) {
+  for (int i = 0; i < 18; i++) {
+    Confetti &c = conf[i];
+    c.y += c.vy * (1.0f + pulse * 0.8f);
+    if (c.y > 44) resetConf(c, true);
+    int px = (int)(c.x + sinf(c.ph + now / 400.0f) * c.sway * 3.0f);
+    int py = (int)c.y;
+    if (c.kind == 0)      display.drawPixel(px, py, WHITE);
+    else if (c.kind == 1) display.fillRect(px, py, 2, 2, WHITE);
+    else                  display.drawFastHLine(px, py, 3, WHITE);
+  }
+}
+
+void balloon(int x, int y, float ph, uint32_t now) {
+  display.fillCircle(x, y, 5, WHITE);
+  display.drawPixel(x - 2, y - 2, BLACK);
+  display.drawPixel(x - 1, y - 3, BLACK);
+  display.drawPixel(x - 3, y - 1, BLACK);
+  display.fillTriangle(x, y + 5, x - 2, y + 8, x + 2, y + 8, WHITE);
+  for (int k = 0; k < 9; k++) {
+    display.drawPixel(x + (int)(sinf(k * 0.8f + now / 300.0f + ph) * 1.6f), y + 9 + k, WHITE);
+  }
+}
+
+void drawBalloons(uint32_t now) {
+  balloon(10,  16 + (int)(3 * sinf(now / 600.0f + 0.0f)), 0.0f, now);
+  balloon(25,  26 + (int)(3 * sinf(now / 600.0f + 1.7f)), 1.7f, now);
+  balloon(103, 26 + (int)(3 * sinf(now / 600.0f + 4.6f)), 4.6f, now);
+  balloon(118, 16 + (int)(3 * sinf(now / 600.0f + 3.1f)), 3.1f, now);
+}
+
+void drawCake(int yo, bool flames, uint32_t now) {
+  display.drawFastHLine(28, 45 + yo, 72, WHITE);              // plate
+
+  // bottom tier
+  display.drawRect(36, 34 + yo, 56, 11, WHITE);
+  display.fillRoundRect(35, 34 + yo, 58, 4, 2, WHITE);
+  const uint8_t d1[5] = {39, 50, 62, 73, 85};
+  for (int i = 0; i < 5; i++) display.fillRect(d1[i], 38 + yo, 2, (i % 2) ? 2 : 3, WHITE);
+  for (int x = 40; x < 90; x += 7) display.drawPixel(x, 42 + yo, WHITE);
+
+  // top tier
+  display.drawRect(46, 24 + yo, 36, 10, WHITE);
+  display.fillRoundRect(45, 24 + yo, 38, 4, 2, WHITE);
+  const uint8_t d2[4] = {49, 58, 68, 77};
+  for (int i = 0; i < 4; i++) display.fillRect(d2[i], 28 + yo, 2, (i % 2) ? 3 : 2, WHITE);
+  for (int x = 50; x < 80; x += 6) display.drawPixel(x, 31 + yo, WHITE);
+
+  // candles + flames
+  const int cx[3] = {54, 64, 74};
+  for (int i = 0; i < 3; i++) {
+    display.fillRect(cx[i] - 1, 17 + yo, 3, 7, WHITE);
+    display.drawPixel(cx[i], 18 + yo, BLACK);
+    display.drawPixel(cx[i], 20 + yo, BLACK);
+    display.drawPixel(cx[i], 22 + yo, BLACK);
+    if (flames) {
+      float f = sinf(now / 70.0f + i * 2.0f) * 0.6f + sinf(now / 43.0f + i) * 0.4f;
+      int h = 4 + (int)roundf(f * 1.5f + pulse * 2.0f);
+      int dx = (int)roundf(sinf(now / 110.0f + i * 1.7f) * 1.2f);
+      display.fillTriangle(cx[i] - 2, 14 + yo, cx[i] + 2, 14 + yo, cx[i] + dx, 13 - h + yo, WHITE);
+      display.fillCircle(cx[i], 14 + yo, 2, WHITE);
+      display.drawPixel(cx[i], 14 + yo, BLACK);
+    }
+  }
+}
+
+void drawSmoke(int32_t t) {
+  if (t > 900) return;
+  const int cx[3] = {54, 64, 74};
+  for (int i = 0; i < 3; i++) {
+    for (int k = 0; k < 3; k++) {
+      int y = 14 - t / 50 - k * 4;
+      if (y > 0) display.drawPixel(cx[i] + (int)(sinf(y * 0.8f + i) * 2), y, WHITE);
+    }
+  }
+}
+
+void drawFloatNotes() {
+  for (int i = 0; i < 5; i++) {
+    if (!fnotes[i].on) continue;
+    fnotes[i].y -= 0.9f;
+    if (fnotes[i].y < -8) { fnotes[i].on = false; continue; }
+    int x = (int)(fnotes[i].x + sinf(fnotes[i].y * 0.18f + fnotes[i].ph) * 4);
+    int y = (int)fnotes[i].y;
+    display.fillCircle(x, y, 2, WHITE);
+    display.drawFastVLine(x + 2, y - 7, 8, WHITE);
+    display.drawLine(x + 2, y - 7, x + 4, y - 5, WHITE);
+  }
+}
+
+const int8_t SPX[6] = {44, 84, 34, 94, 58, 70};
+const int8_t SPY[6] = {10, 10, 24, 24, 4, 4};
+const int8_t OSX[8] = {10, 30, 50, 78, 98, 118, 40, 88};
+const int8_t OSY[8] = {6, 10, 4, 4, 10, 6, 28, 28};
+
+void sceneParty(Phase ph, uint32_t now, int32_t t) {
+  uint32_t b = beat;
+  if (b != lastBeat) { lastBeat = b; pulse = 1.0f; spawnNote(); }
+  pulse *= 0.85f;
+
+  drawConfetti(now);
+  drawBalloons(now);
+
+  int yo = -1;
+  if (ph == PH_PLAY) yo += (int)((1.0f - easeOut(t / 700.0f)) * 46);   // cake rises in
+  bool flames = (ph != PH_OUTRO) || (t < (int32_t)BLOW_MS);
+  drawCake(yo, flames, now);
+  if (ph == PH_OUTRO && t >= (int32_t)BLOW_MS) drawSmoke(t - BLOW_MS);
+
+  drawFloatNotes();
+
+  if (ph == PH_PLAY && pulse > 0.25f) {
+    int i = b % 6;
+    sparkle(SPX[i], SPY[i], 1 + (int)(pulse * 2));
+  }
+  if (ph == PH_OUTRO) {
+    for (int i = 0; i < 8; i++) {
+      int r = 1 + (int)(1.5f * (1.0f + sinf(now / 150.0f + i * 1.3f)));
+      if (r > 3) r = 3;
+      sparkle(OSX[i], OSY[i], r);
+    }
+  }
+
+  // lyric band
+  if (ph == PH_PLAY) {
+    int w = curWord;
+    if (w >= 0) drawBand(words[w], now - wordStart, LYR, 3);
+  } else {
+    if (t < 1500) drawBand("Make a", (uint32_t)t, BIG, 4);
+    else          drawBand("Wish!", (uint32_t)(t - 1500), BIG, 4);
+  }
+}
+
+void drawFrame() {
+  uint32_t now = millis();
+  Phase ph = phase;
+  int32_t t = (int32_t)(now - phaseStart);
+  if (t < 0) t = 0;
+
+  display.clearDisplay();
+  if (ph == PH_TIMER)        sceneTimer(now, t);
+  else if (ph == PH_ITSTIME) sceneTime(now, t);
+  else                       sceneParty(ph, now, t);
+  display.display();
+}
+
+void animTask(void *) {
+  for (;;) {
+    uint32_t s = millis();
+    drawFrame();
+    uint32_t e = millis() - s;
+    if (e < FRAME_MS) vTaskDelay(pdMS_TO_TICKS(FRAME_MS - e));
+    else              vTaskDelay(1);
+  }
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  for (int i = 0; i < 6; i++) { pinMode(LED_PINS[i], OUTPUT); digitalWrite(LED_PINS[i], LOW); }
+  buzzSetup();
+  buzzRaw(0);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);                // try 800000 for even smoother animation if your OLED allows
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    // OLED not found: blink first LED forever
+    for (;;) { digitalWrite(LED_PINS[0], !digitalRead(LED_PINS[0])); delay(200); }
+  }
+  display.clearDisplay();
+  display.setTextWrap(false);
+  display.display();
+
+  randomSeed(esp_random());
+  for (int i = 0; i < 18; i++) resetConf(conf[i], false);
+  for (int i = 0; i < 5; i++) fnotes[i].on = false;
+  for (int i = 0; i < SPARKS; i++) sp[i].life = 0;
+
+  startTimer();
+  xTaskCreatePinnedToCore(animTask, "anim", 6144, NULL, 1, NULL, 0);
+}
+
+void loop() {
+  uint32_t now = millis();
+  uint32_t t = now - phaseStart;
+
+  if (phase == PH_TIMER)        updateTimer(t);
+  else if (phase == PH_ITSTIME) updateItsTime(t);
+  else if (phase == PH_PLAY)    updatePlay(now);
+  else                          updateOutro(now);
+
+  delay(1);
+}
