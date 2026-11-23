@@ -7,7 +7,13 @@
 
 A DIY electronic birthday surprise built with an **ESP32**, a **0.96" OLED**, a **passive buzzer** and **6 LEDs**.
 It counts down to **12:00 PM**, flashes **"It's Time!"**, then plays the **Happy Birthday** melody note by note while the lyrics, a cake animation and every LED react to the music, and finally shows **"Make a Wish!"** before looping again.
+## Author
 
+**Soumik Ghosh** — *TechTadka360*  
+- YouTube: [@techtadka360official](https://www.youtube.com/@techtadka360official)  
+- Instagram: [@techtadka360official](https://www.instagram.com/techtadka360official)  
+- GitHub: [Mr-soumik](https://github.com/Mr-soumik)
+- Facebook: [@techtadka360](https://www.facebook.com/share/1F3sa9eeeV/)
 > Made by **Soumik** for the [TechTadka360](https://github.com/Mr-soumik) maker channel.
 
 <!-- Add your demo GIF or video link here, for example:
